@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cache_service_desc">Opens the Storage page of each app and taps Clear cache for you. Only active while you run Auto-clean inside Deep Cleaner.</string>
+</resources>
