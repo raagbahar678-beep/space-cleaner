@@ -32,6 +32,19 @@
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
 
+        <service
+            android:name=".CacheCleanService"
+            android:exported="false"
+            android:label="Deep Cleaner cache cleaning"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+
     </application>
 
 </manifest>
