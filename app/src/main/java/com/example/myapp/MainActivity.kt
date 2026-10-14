@@ -1,6 +1,7 @@
 package com.example.myapp
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityService
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
@@ -42,6 +43,8 @@ import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.ViewGroup
 import android.widget.BaseAdapter
 import android.widget.Button
@@ -341,6 +344,266 @@ class AutoCleanService : JobService() {
 
     override fun onStopJob(params: JobParameters): Boolean {
         return false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto cache clean (Accessibility helper): opens each app's Storage page and taps "Clear cache"
+// ─────────────────────────────────────────────────────────────────────────────
+
+object CacheJob {
+    @Volatile var running = false
+    val queue = ArrayList<String>()
+    @Volatile var index = 0
+    @Volatile var cleaned = 0
+    @Volatile var skipped = 0
+    @Volatile var step = 0
+    @Volatile var stepAt = 0L
+    @Volatile var misses = 0
+    @Volatile var result = ""
+}
+
+class CacheCleanService : AccessibilityService() {
+
+    companion object {
+        @Volatile var instance: CacheCleanService? = null
+    }
+
+    private val hnd = Handler(Looper.getMainLooper())
+    private var pending = false
+    private val clearWords = arrayOf("clear", "clean", "साफ", "हटा", "delete", "empty")
+
+    private val tick = Runnable {
+        pending = false
+        try {
+            process()
+        } catch (e: Exception) {
+        }
+    }
+
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!CacheJob.running) return
+            if (System.currentTimeMillis() - CacheJob.stepAt > 8000L) {
+                CacheJob.skipped++
+                next()
+            }
+            hnd.postDelayed(this, 1000L)
+        }
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        instance = null
+        CacheJob.running = false
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        instance = null
+        super.onDestroy()
+    }
+
+    override fun onInterrupt() {
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!CacheJob.running || event == null) return
+        if (!pending) {
+            pending = true
+            hnd.postDelayed(tick, 350L)
+        }
+    }
+
+    fun beginJob() {
+        CacheJob.running = true
+        CacheJob.index = 0
+        CacheJob.cleaned = 0
+        CacheJob.skipped = 0
+        CacheJob.step = 0
+        CacheJob.misses = 0
+        CacheJob.result = ""
+        CacheJob.stepAt = System.currentTimeMillis()
+        hnd.removeCallbacks(watchdog)
+        hnd.postDelayed(watchdog, 1000L)
+        launch()
+    }
+
+    private fun launch() {
+        if (!CacheJob.running) return
+        if (CacheJob.index >= CacheJob.queue.size) {
+            finishJob()
+            return
+        }
+        CacheJob.step = 0
+        CacheJob.misses = 0
+        CacheJob.stepAt = System.currentTimeMillis()
+        try {
+            val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            i.data = Uri.parse("package:" + CacheJob.queue[CacheJob.index])
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            startActivity(i)
+        } catch (e: Exception) {
+            CacheJob.skipped++
+            CacheJob.index = CacheJob.index + 1
+            hnd.postDelayed({ launch() }, 300L)
+        }
+    }
+
+    private fun next() {
+        CacheJob.index = CacheJob.index + 1
+        CacheJob.step = 0
+        CacheJob.misses = 0
+        CacheJob.stepAt = System.currentTimeMillis() + 1500L
+        hnd.postDelayed({ launch() }, 500L)
+    }
+
+    private fun finishJob() {
+        CacheJob.running = false
+        hnd.removeCallbacks(watchdog)
+        var r = "Cleared the cache of " + CacheJob.cleaned.toString() + " app(s)."
+        if (CacheJob.skipped > 0) {
+            r += "\n" + CacheJob.skipped.toString() + " app(s) skipped (page not recognised or nothing to clear)."
+        }
+        CacheJob.result = r
+        try {
+            val i = Intent(this, MainActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            startActivity(i)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun markDoneSoon(idx: Int, delay: Long, count: Boolean) {
+        hnd.postDelayed({
+            if (CacheJob.running && CacheJob.index == idx) {
+                if (count) CacheJob.cleaned = CacheJob.cleaned + 1
+                next()
+            }
+        }, delay)
+    }
+
+    private fun textOf(n: AccessibilityNodeInfo): String {
+        val t: CharSequence? = n.text ?: n.contentDescription
+        return if (t == null) "" else t.toString().trim().lowercase()
+    }
+
+    private fun collect(n: AccessibilityNodeInfo?, out: ArrayList<AccessibilityNodeInfo>, depth: Int) {
+        if (n == null || depth > 40 || out.size > 500) return
+        out.add(n)
+        for (i in 0 until n.childCount) collect(n.getChild(i), out, depth + 1)
+    }
+
+    private fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var c: AccessibilityNodeInfo? = n
+        var d = 0
+        while (c != null && d < 5) {
+            if (c.isClickable) return c
+            c = c.parent
+            d++
+        }
+        return null
+    }
+
+    private fun clickNode(n: AccessibilityNodeInfo): Boolean {
+        return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    }
+
+    private fun findClearCache(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
+        for (n in nodes) {
+            val t = textOf(n)
+            if (t.isEmpty() || t.length > 40) continue
+            if (!(t.contains("cache") || t.contains("कैश"))) continue
+            var hasClear = false
+            for (w in clearWords) if (t.contains(w)) hasClear = true
+            if (!hasClear) continue
+            val c = clickableOf(n)
+            if (c != null) return c
+        }
+        return null
+    }
+
+    private fun findStorage(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
+        for (n in nodes) {
+            val t = textOf(n)
+            if (t.isEmpty() || t.length > 60) continue
+            if (t.contains("clear")) continue
+            if (t.contains("storage") || t.contains("स्टोरेज")) {
+                val c = clickableOf(n)
+                if (c != null) return c
+            }
+        }
+        return null
+    }
+
+    private fun process() {
+        if (!CacheJob.running) return
+        val root = rootInActiveWindow ?: return
+        val pkg = root.packageName?.toString() ?: ""
+        if (pkg == packageName || pkg == "com.android.systemui" || pkg.contains("launcher") ||
+            pkg.contains("inputmethod") || pkg.contains("keyboard")
+        ) return
+        val nodes = ArrayList<AccessibilityNodeInfo>()
+        collect(root, nodes, 0)
+        val idx = CacheJob.index
+
+        if (CacheJob.step == 2) {
+            // after tapping Clear cache: some phones show a small confirmation
+            var hasCache = false
+            for (n in nodes) {
+                val t = textOf(n)
+                if (t.contains("cache")) hasCache = true
+            }
+            if (hasCache) {
+                for (n in nodes) {
+                    val t = textOf(n)
+                    if (t == "ok" || t == "yes" || t == "confirm") {
+                        if (clickNode(n)) return
+                    }
+                }
+            }
+            return
+        }
+
+        val cc = findClearCache(nodes)
+        if (cc != null) {
+            if (!cc.isEnabled) {
+                CacheJob.step = 2
+                markDoneSoon(idx, 300L, false)
+                return
+            }
+            if (clickNode(cc)) {
+                CacheJob.step = 2
+                CacheJob.stepAt = System.currentTimeMillis()
+                markDoneSoon(idx, 1500L, true)
+            }
+            return
+        }
+
+        if (CacheJob.step == 0) {
+            val st = findStorage(nodes)
+            if (st != null && clickNode(st)) {
+                CacheJob.step = 1
+                CacheJob.misses = 0
+                CacheJob.stepAt = System.currentTimeMillis()
+                return
+            }
+        }
+
+        CacheJob.misses = CacheJob.misses + 1
+        if (CacheJob.step == 1 && CacheJob.misses == 4) CacheJob.step = 0
+        if (CacheJob.misses >= 2) {
+            for (n in nodes) {
+                if (n.isScrollable) {
+                    n.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                    break
+                }
+            }
+        }
     }
 }
 
@@ -1079,8 +1342,24 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (CacheJob.running) {
+            CacheJob.running = false
+            toast("Auto cache clean stopped")
+        }
         refreshHome()
-        if (curTab == 2) loadApps()
+        val res = CacheJob.result
+        if (res.isNotEmpty()) {
+            CacheJob.result = ""
+            showTab(2)
+            loadApps()
+            AlertDialog.Builder(this)
+                .setTitle("Auto cache clean finished")
+                .setMessage(res + "\nThe app list is refreshed with the new sizes.")
+                .setPositiveButton("OK", null)
+                .show()
+        } else if (curTab == 2) {
+            loadApps()
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -1574,6 +1853,10 @@ class MainActivity : Activity() {
         ar.addView(mkBtn("Clean biggest cache", Col.ACC, Col.DARKTXT) { openBiggestCache() }, lpm(0, WC, 1f, 0, 0, 4, 0))
         ar.addView(mkBtn("Storage settings", Col.CARD2, Col.TXT) { openStorageSettings() }, lpm(0, WC, 1f, 4, 0, 0, 0))
         col.addView(ar)
+        col.addView(
+            mkBtn("🤖  Auto-clean ALL app caches", Col.ACC, Col.DARKTXT) { startAutoCache() },
+            lpm(MP, WC, 0f, 0, 6, 0, 0)
+        )
 
         val sr = LinearLayout(this)
         sr.orientation = LinearLayout.HORIZONTAL
@@ -1776,7 +2059,7 @@ class MainActivity : Activity() {
         }
         appsAdapter.submitRows(rows)
         appsInfo.text = list.size.toString() + " apps" + (if (usageOk) "  ·  total cache " + fmt(cacheSum) else "") +
-            "\nAndroid only lets you clear another app's cache from its own info page."
+            "\nTip: Auto-clean ALL app caches needs the helper switched on in Accessibility settings."
         val names = arrayOf("Cache", "Size", "Unused", if (appsShowSystem) "All apps" else "User apps")
         for (i in sortBtns.indices) {
             sortBtns[i].text = names[i]
@@ -2423,6 +2706,68 @@ class MainActivity : Activity() {
         confirmClean(items)
     }
 
+    // ── Auto cache clean (Accessibility helper) ────────────────────────────
+
+    private fun startAutoCache() {
+        val svc = CacheCleanService.instance
+        if (svc == null) {
+            AlertDialog.Builder(this)
+                .setTitle("Turn on the cache-cleaning helper")
+                .setMessage(
+                    "Android does not let apps clear other apps' caches directly. The helper (an Accessibility service) " +
+                        "opens each app's Storage page and taps \"Clear cache\" for you.\n\n" +
+                        "1. Tap Open settings\n" +
+                        "2. Find Deep Cleaner > \"Deep Cleaner cache cleaning\" and switch it ON\n" +
+                        "3. Come back here and tap Auto-clean again\n\n" +
+                        "If the switch is greyed out (Android 13+): Settings > Apps > Deep Cleaner > menu (3 dots) > Allow restricted settings.\n\n" +
+                        "It only acts while you run Auto-clean here. Your apps' data and logins are not touched, only cache."
+                )
+                .setPositiveButton("Open settings", DialogInterface.OnClickListener { _, _ ->
+                    try {
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    } catch (e: Exception) {
+                        toast("Open Settings > Accessibility")
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show()
+            return
+        }
+        if (!usageOk) {
+            toast("Grant usage access first (needed to know cache sizes)")
+            openUsageSettings()
+            return
+        }
+        val list = ArrayList<AppRec>()
+        for (a in appsAll) {
+            if (a.cache >= 1048576L && a.pkg != packageName) list.add(a)
+        }
+        list.sortWith(Comparator { a, b -> b.cache.compareTo(a.cache) })
+        while (list.size > 60) list.removeAt(list.size - 1)
+        if (list.isEmpty()) {
+            toast("No app has 1 MB or more of cache")
+            return
+        }
+        var total = 0L
+        for (a in list) total += a.cache
+        val pkgs = ArrayList<String>()
+        for (a in list) pkgs.add(a.pkg)
+        AlertDialog.Builder(this)
+            .setTitle("Clear cache of " + list.size.toString() + " apps?")
+            .setMessage(
+                "About " + fmt(total) + " of cache, biggest apps first.\n\n" +
+                    "The screen will flip through Settings pages for roughly " + (list.size * 4).toString() +
+                    " seconds. Please do not touch the phone until you are brought back here."
+            )
+            .setPositiveButton("Start", DialogInterface.OnClickListener { _, _ ->
+                CacheJob.queue.clear()
+                CacheJob.queue.addAll(pkgs)
+                svc.beginJob()
+            })
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     // ── BOOST TAB ───────────────────────────────────────────────────────────
 
     private fun buildBoost(): View {
@@ -2673,7 +3018,7 @@ class MainActivity : Activity() {
                     "Browse shows what uses space, folder by folder.\n\n" +
                     "Items marked (review) are NOT selected by default - check them first. Auto-clean only touches the safe categories.\n\n" +
                     "Limits of Android: other apps' private caches and the folders Android/data and Android/obb cannot be read or " +
-                    "deleted by any normal app without root. Use the Apps tab to jump to each app's Storage page and tap Clear cache.\n\n" +
+                    "deleted by any normal app without root. Use the Apps tab: Auto-clean ALL app caches (needs the Accessibility helper) or open each app's Storage page.\n\n" +
                     "RAM boost only stops background processes; Android may restart them.\n\n" +
                     "Deleted files are removed permanently (there is no recycle bin)."
             )
