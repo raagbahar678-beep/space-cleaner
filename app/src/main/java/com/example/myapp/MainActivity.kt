@@ -29,6 +29,7 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.media.ExifInterface
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -38,6 +39,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
 import android.os.storage.StorageManager
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
@@ -51,6 +53,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -59,6 +62,7 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -172,6 +176,7 @@ class ScanData {
     val cats = ArrayList<JCat>()
     val big = ArrayList<FItem>()
     val photos = ArrayList<String>()
+    val jpegs = ArrayList<FItem>()
     val sizeMap = HashMap<Long, ArrayList<String>>()
     val typeSize = LongArray(7)
     val typeCount = IntArray(7)
@@ -183,10 +188,10 @@ class ScanData {
         cats.add(JCat(C_TEMP, "Temporary files", ".tmp, .temp, swap and ~ files", false))
         cats.add(JCat(C_LOGS, "Log & crash files", ".log, .dmp, .trace files and log folders", false))
         cats.add(JCat(C_THUMBS, "Thumbnail caches", "Hidden gallery thumbnails (.thumbnails, .thumbdata)", false))
-        cats.add(JCat(C_TRASH, "Trash & recycle bins", "Recently deleted items kept by gallery / file apps", false))
+        cats.add(JCat(C_TRASH, "Trash & recycle bins (review)", "Recently deleted items kept by gallery / file apps", true))
         cats.add(JCat(C_CACHEDIR, "Hidden cache folders", "Folders named .cache, .tmp, .temp", false))
         cats.add(JCat(C_ADSDK, "Ad & analytics leftovers", "Known hidden folders left by ad / tracking SDKs", false))
-        cats.add(JCat(C_EMPTYDIR, "Empty folders", "Folders with nothing inside", false))
+        cats.add(JCat(C_EMPTYDIR, "Empty folders (review)", "Folders with nothing inside - you may want them", true))
         cats.add(JCat(C_VCACHE, "Cache / temp folders (review)", "Visible folders named cache, tmp or temp - check first", true))
         cats.add(JCat(C_BACKUP, "Backup & old files (review)", ".bak, .old, .orig files - may be wanted backups", true))
         cats.add(JCat(C_PARTIAL, "Incomplete downloads (review)", ".crdownload, .part, .partial files", true))
@@ -207,6 +212,29 @@ class ScanData {
     }
 }
 
+class TNode(
+    val path: String,
+    val name: String,
+    val isDir: Boolean,
+    size0: Long,
+    val level: Int,
+    val hidden: Boolean,
+    val mtime: Long
+) {
+    @Volatile var size = size0
+    var expanded = false
+    var loaded = false
+    @Volatile var loading = false
+    var restricted = false
+    var checked = false
+    var children = ArrayList<TNode>()
+    var itemCount = 0
+}
+
+object Vols {
+    @Volatile var roots: List<String> = ArrayList<String>()
+}
+
 class Row(val type: Int) {
     var title = ""
     var sub = ""
@@ -221,6 +249,8 @@ class Row(val type: Int) {
     var rightColor = 0
     var expanded = false
     var tag = ""
+    var node: TNode? = null
+    var indentDp = -1
 }
 
 open class RowL {
@@ -267,10 +297,29 @@ fun treeSize(d: File): Long {
     return total
 }
 
+// Top-level storage folders that must never be deleted.
+fun isProtectedPath(path: String): Boolean {
+    val roots = ArrayList<String>()
+    roots.add(Environment.getExternalStorageDirectory().path)
+    for (r in Vols.roots) if (!roots.contains(r)) roots.add(r)
+    val names = arrayOf(
+        "DCIM", "Pictures", "Download", "Documents", "Music", "Movies", "Android",
+        "Alarms", "Notifications", "Podcasts", "Ringtones", "Recordings", "Audiobooks"
+    )
+    for (root in roots) {
+        if (path == root || path == root + "/") return true
+        for (n in names) {
+            if (path == root + "/" + n) return true
+        }
+    }
+    return false
+}
+
 // Deletes the given items; paths that are gone afterwards are added to `deleted`. Returns bytes freed.
 fun deleteFItems(items: List<FItem>, deleted: ArrayList<String>): Long {
     var freed = 0L
     for (fi in items) {
+        if (isProtectedPath(fi.path)) continue
         val f = File(fi.path)
         val existed = f.exists()
         val good = if (!existed) {
@@ -695,6 +744,7 @@ class Scanner(
             c.recalc()
         }
         data.big.sortByDescending { it.size }
+        data.jpegs.sortByDescending { it.size }
         if (data.big.size > 3000) {
             data.big.subList(3000, data.big.size).clear()
         }
@@ -853,6 +903,9 @@ class Scanner(
                 data.typeSize[t] += len
                 data.typeCount[t] += 1
                 if (t == 0 && len >= 30720L && data.photos.size < 20000) data.photos.add(f.path)
+                if ((ext == "jpg" || ext == "jpeg") && len >= 524288L && data.jpegs.size < 20000) {
+                    data.jpegs.add(FItem(f.path, len, false, -4, true))
+                }
                 if (len >= 10L * 1024L * 1024L) {
                     data.big.add(FItem(f.path, len, false, -1, false))
                 }
@@ -1052,7 +1105,8 @@ class RowAdapter(private val act: Activity, private val lis: RowL) : BaseAdapter
         }
         bg.setColor(bgColor)
         h.root.background = bg
-        h.root.setPadding(dp(if (r.type == T_ITEM) 24 else 10), dp(8), dp(10), dp(8))
+        val padL = if (r.indentDp >= 0) r.indentDp else if (r.type == T_ITEM) 24 else 10
+        h.root.setPadding(dp(padL), dp(8), dp(10), dp(8))
 
         h.title.text = r.title
         h.sub.text = r.sub
@@ -1117,10 +1171,13 @@ class MainActivity : Activity() {
     private var dupBusy = false
     private var simGroups: ArrayList<DupGroup>? = null
     private var simBusy = false
+    private var shrinkQ = 80
+    private var shrinkDim = 0
+    private var moveItems = ArrayList<FItem>()
+    private lateinit var btnFilesAct2: Button
+    private lateinit var btnFilesMove: Button
     @Volatile private var simDone = 0
     @Volatile private var simTotal = 0
-    @Volatile private var browseGen = 0
-    private var browsePath: String = Environment.getExternalStorageDirectory().path
     @Volatile private var dupDone = 0
     @Volatile private var dupTotal = 0
     @Volatile private var dupCancel = false
@@ -1311,6 +1368,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("cleaner", MODE_PRIVATE)
         largeMb = prefs.getInt("large_mb", 50)
+        detectVolumes()
 
         window.setBackgroundDrawable(ColorDrawable(Col.BG))
         window.statusBarColor = Col.BG
@@ -1360,6 +1418,122 @@ class MainActivity : Activity() {
         } else if (curTab == 2) {
             loadApps()
         }
+        if (res.isEmpty()) checkGrowth()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // remember how full internal storage was when the app was left
+        if (!growthBusy && !busyDelete && !scanning) saveBaseline()
+    }
+
+    // ── Storage growth watcher ──────────────────────────────────────────────
+    // Remembers the used internal storage when you leave the app. On the next open, if the used space
+    // grew (e.g. 45 GB -> 45.6 GB), it deletes new SAFE junk (temp, logs, thumbnails, hidden caches,
+    // ad leftovers, status cache) up to the amount of growth. Your own files (photos, videos, downloads,
+    // chats, review categories) are never touched by this.
+
+    private var growthBusy = false
+
+    private fun growthOn(): Boolean {
+        return prefs.getBoolean("growth_on", true)
+    }
+
+    private fun usedBytes(): Long {
+        return try {
+            val st = StatFs(Environment.getExternalStorageDirectory().path)
+            st.totalBytes - st.availableBytes
+        } catch (e: Exception) {
+            -1L
+        }
+    }
+
+    private fun saveBaseline() {
+        val u = usedBytes()
+        if (u >= 0L) prefs.edit().putLong("base_used", u).apply()
+    }
+
+    private fun checkGrowth() {
+        if (!growthOn() || growthBusy || busyDelete || scanning || CacheJob.running) return
+        if (!hasStorageAccess()) return
+        val used = usedBytes()
+        if (used < 0L) return
+        val base = prefs.getLong("base_used", -1L)
+        if (base < 0L) {
+            prefs.edit().putLong("base_used", used).apply()
+            return
+        }
+        val growth = used - base
+        if (growth < 50L * 1048576L) {
+            prefs.edit().putLong("base_used", used).apply()
+            return
+        }
+        growthBusy = true
+        toast("Storage grew by " + fmt(growth) + " - cleaning new junk...")
+        val inst = HashSet<String>()
+        try {
+            for (ai in packageManager.getInstalledApplications(0)) inst.add(ai.packageName.lowercase())
+        } catch (e: Exception) {
+        }
+        val ex = excludedList()
+        Thread(Runnable {
+            var freed = 0L
+            var count = 0
+            val deleted = ArrayList<String>()
+            try {
+                val data = ScanData()
+                val sc = Scanner(this, Environment.getExternalStorageDirectory(), inst, ex, data)
+                sc.run()
+                val cand = ArrayList<FItem>()
+                for (c in data.cats) {
+                    if (c.review) continue
+                    for (i in c.items) cand.add(i)
+                }
+                // newest junk first: that is what appeared since the last time
+                cand.sortWith(Comparator { a, b -> File(b.path).lastModified().compareTo(File(a.path).lastModified()) })
+                val pick = ArrayList<FItem>()
+                var sum = 0L
+                for (fi in cand) {
+                    if (sum >= growth) break
+                    pick.add(fi)
+                    sum += fi.size
+                }
+                freed = deleteFItems(pick, deleted)
+                count = deleted.size
+                if (deleted.isNotEmpty()) scanMedia(deleted)
+            } catch (e: Exception) {
+            }
+            val fr = freed
+            val cnt = count
+            runOnUiThread {
+                growthBusy = false
+                val after = usedBytes()
+                if (after >= 0L) prefs.edit().putLong("base_used", after).apply()
+                if (fr > 0L) {
+                    prefs.edit()
+                        .putLong("freed_total", prefs.getLong("freed_total", 0L) + fr)
+                        .putLong("last_clean", System.currentTimeMillis())
+                        .apply()
+                }
+                scan = null
+                refreshHome()
+                rebuildJunk()
+                if (!isFinishing) {
+                    val rest = if (growth > fr) growth - fr else 0L
+                    var msg = "Used storage grew by " + fmt(growth) + " since you last used the app.\n" +
+                        "Deleted " + cnt.toString() + " junk item(s): " + fmt(fr) + "."
+                    if (rest > 0L) {
+                        msg += "\n\nThe other " + fmt(rest) + " is not junk (new photos, downloads, app data, updates...) " +
+                            "so it was left alone. Use Large files / Explore to review it."
+                    }
+                    AlertDialog.Builder(this)
+                        .setTitle("Storage growth check")
+                        .setMessage(msg)
+                        .setPositiveButton("OK", null)
+                        .show()
+                }
+            }
+        }).start()
     }
 
     @Deprecated("Deprecated in Java")
@@ -1427,6 +1601,10 @@ class MainActivity : Activity() {
         rr.orientation = LinearLayout.HORIZONTAL
         ringStorage = RingView(this)
         ringRam = RingView(this)
+        ringStorage.setOnClickListener {
+            showTab(3)
+            setFilesMode(4)
+        }
         rr.addView(ringStorage, LinearLayout.LayoutParams(0, dp(170), 1f))
         rr.addView(ringRam, LinearLayout.LayoutParams(0, dp(170), 1f))
         col.addView(rr, lpm(MP, WC, 0f, 0, 14, 0, 0))
@@ -1464,6 +1642,12 @@ class MainActivity : Activity() {
         r3.addView(mkBtn("🗂 Browse storage", Col.CARD2, Col.TXT) { showTab(3); setFilesMode(4) }, lpm(0, WC, 1f, 4, 0, 0, 0))
         col.addView(r3, lpm(MP, WC, 0f, 0, 8, 0, 0))
 
+        val r4 = LinearLayout(this)
+        r4.orientation = LinearLayout.HORIZONTAL
+        r4.addView(mkBtn("🧽 Trim app caches", Col.CARD2, Col.TXT) { trimSystemCaches() }, lpm(0, WC, 1f, 0, 0, 4, 0))
+        r4.addView(mkBtn("🗜 Shrink photos", Col.CARD2, Col.TXT) { showTab(3); setFilesMode(5) }, lpm(0, WC, 1f, 4, 0, 0, 0))
+        col.addView(r4, lpm(MP, WC, 0f, 0, 8, 0, 0))
+
         col.addView(
             mkBtn("⚙  Settings & info", Col.CARD, Col.SUB) { showSettings() },
             lpm(MP, WC, 0f, 0, 8, 0, 0)
@@ -1495,7 +1679,7 @@ class MainActivity : Activity() {
             val used = total - free
             val frac = if (total > 0L) used.toFloat() / total.toFloat() else 0f
             ringStorage.setValue(frac, Math.round(frac * 100f).toString() + "%", "Storage used")
-            homeStorageTv.text = "Free " + fmt(free) + " of " + fmt(total)
+            homeStorageTv.text = "Free " + fmt(free) + " of " + fmt(total) + "\nTap the ring to explore"
         } catch (e: Exception) {
             homeStorageTv.text = "Storage info unavailable"
         }
@@ -1737,11 +1921,18 @@ class MainActivity : Activity() {
             return
         }
         var total = 0L
-        for (i in items) total += i.size
+        var folders = 0
+        for (i in items) {
+            total += i.size
+            if (i.isDir) folders++
+        }
+        var msg = items.size.toString() + " item(s), " + fmt(total) + "."
+        if (folders > 0) msg += "\n" + folders.toString() + " folder(s) will be deleted together with everything inside."
+        msg += "\nThis cannot be undone."
         AlertDialog.Builder(this)
             .setTitle("Delete permanently?")
-            .setMessage(items.size.toString() + " item(s), " + fmt(total) + ".\nThis cannot be undone.")
-            .setPositiveButton("Clean", DialogInterface.OnClickListener { _, _ -> doDelete(items) })
+            .setMessage(msg)
+            .setPositiveButton("Delete", DialogInterface.OnClickListener { _, _ -> doDelete(items) })
             .setNegativeButton("Cancel", null)
             .show()
     }
@@ -1829,9 +2020,14 @@ class MainActivity : Activity() {
             while (it3.hasNext()) {
                 if (gone.contains(it3.next())) it3.remove()
             }
+            val it4 = d.jpegs.iterator()
+            while (it4.hasNext()) {
+                if (gone.contains(it4.next().path)) it4.remove()
+            }
         }
         pruneGroups(dupGroups, gone)
         pruneGroups(simGroups, gone)
+        pruneTreeRoot(gone)
     }
 
     // ── APPS TAB ────────────────────────────────────────────────────────────
@@ -1855,6 +2051,10 @@ class MainActivity : Activity() {
         col.addView(ar)
         col.addView(
             mkBtn("🤖  Auto-clean ALL app caches", Col.ACC, Col.DARKTXT) { startAutoCache() },
+            lpm(MP, WC, 0f, 0, 6, 0, 0)
+        )
+        col.addView(
+            mkBtn("🧽  Ask Android to trim app caches", Col.CARD2, Col.TXT) { trimSystemCaches() },
             lpm(MP, WC, 0f, 0, 6, 0, 0)
         )
 
@@ -2078,23 +2278,30 @@ class MainActivity : Activity() {
 
         col.addView(mkText("Space finder", 20f, Col.TXT, true))
 
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
         val tr = LinearLayout(this)
         tr.orientation = LinearLayout.HORIZONTAL
-        val labels = arrayOf("Storage", "Large", "Dupes", "Similar", "Browse")
+        val labels = arrayOf("Storage", "Large", "Dupes", "Similar", "Explore", "Shrink")
         for (i in labels.indices) {
             val b = mkBtn(labels[i], Col.CARD2, Col.TXT) { setFilesMode(i) }
-            b.textSize = 11f
-            b.setPadding(dp(2), dp(8), dp(2), dp(8))
-            tr.addView(b, lpm(0, WC, 1f, 1, 0, 1, 0))
+            b.textSize = 12f
+            tr.addView(b, lpm(WC, WC, 0f, 2, 0, 2, 0))
             filesTabBtns.add(b)
         }
-        col.addView(tr, lpm(MP, WC, 0f, 0, 8, 0, 6))
+        hs.addView(tr)
+        col.addView(hs, lpm(MP, WC, 0f, 0, 8, 0, 6))
 
         filesInfo = mkText("", 12f, Col.SUB, false)
         col.addView(filesInfo, lpm(MP, WC, 0f, 0, 0, 0, 6))
 
+        val actRow = LinearLayout(this)
+        actRow.orientation = LinearLayout.HORIZONTAL
         btnFilesAct = mkBtn("", Col.CARD2, Col.TXT) { onFilesAct() }
-        col.addView(btnFilesAct, lpm(MP, WC, 0f, 0, 0, 0, 6))
+        btnFilesAct2 = mkBtn("", Col.CARD2, Col.TXT) { onFilesAct2() }
+        actRow.addView(btnFilesAct, lpm(0, WC, 1f, 0, 0, 3, 0))
+        actRow.addView(btnFilesAct2, lpm(0, WC, 1f, 3, 0, 0, 0))
+        col.addView(actRow, lpm(MP, WC, 0f, 0, 0, 0, 6))
 
         val fl = FrameLayout(this)
         storageBox = LinearLayout(this)
@@ -2111,11 +2318,7 @@ class MainActivity : Activity() {
                 val grp = r.group
                 val fi = r.item
                 if (filesMode == 4) {
-                    if (r.tag == "up") {
-                        browseUp()
-                    } else if (fi != null) {
-                        if (fi.isDir) browseInto(fi.path) else showPath(fi)
-                    }
+                    treeRowClick(r)
                     return
                 }
                 if (grp != null) {
@@ -2130,12 +2333,19 @@ class MainActivity : Activity() {
             }
 
             override fun onLong(r: Row) {
+                if (filesMode == 4) {
+                    treeRowLong(r)
+                    return
+                }
                 val fi = r.item
-                if (fi == null) return
-                if (filesMode == 4) browseDelete(fi) else showPath(fi)
+                if (fi != null) showPath(fi)
             }
 
             override fun onCheck(r: Row, checked: Boolean) {
+                if (filesMode == 4) {
+                    treeRowCheck(r, checked)
+                    return
+                }
                 val fi = r.item
                 if (fi != null) {
                     fi.checked = checked
@@ -2147,8 +2357,10 @@ class MainActivity : Activity() {
         fl.addView(filesList, FrameLayout.LayoutParams(MP, MP))
         col.addView(fl, LinearLayout.LayoutParams(MP, 0, 1f))
 
+        btnFilesMove = mkBtn("", Col.ACC, Col.DARKTXT) { onFilesMove() }
+        col.addView(btnFilesMove, lpm(MP, WC, 0f, 0, 8, 0, 0))
         btnFilesDel = mkBtn("Delete selected", Col.BAD, Color.WHITE) { deleteFilesSelected() }
-        col.addView(btnFilesDel, lpm(MP, WC, 0f, 0, 8, 0, 0))
+        col.addView(btnFilesDel, lpm(MP, WC, 0f, 0, 6, 0, 0))
         return col
     }
 
@@ -2158,6 +2370,13 @@ class MainActivity : Activity() {
     }
 
     private fun onFilesAct() {
+        if (filesMode == 4) {
+            treeSort = (treeSort + 1) % 3
+            val tr = treeRoot
+            if (tr != null) sortNodes(tr.children)
+            renderTree()
+            return
+        }
         val d = scan
         if (d == null) {
             startScan(false)
@@ -2182,6 +2401,12 @@ class MainActivity : Activity() {
             } else {
                 findSimilar()
             }
+        } else if (filesMode == 5) {
+            val opts = intArrayOf(90, 85, 80, 70, 60)
+            var idx = 0
+            for (k in opts.indices) if (opts[k] == shrinkQ) idx = k
+            shrinkQ = opts[(idx + 1) % opts.size]
+            rebuildFiles()
         }
     }
 
@@ -2194,19 +2419,36 @@ class MainActivity : Activity() {
         val d = scan
         storageScroll.visibility = if (filesMode == 0) View.VISIBLE else View.GONE
         filesList.visibility = if (filesMode == 0) View.GONE else View.VISIBLE
-        btnFilesDel.visibility = if (filesMode == 0 || filesMode == 4) View.GONE else View.VISIBLE
+        btnFilesDel.visibility = if (filesMode == 1 || filesMode == 2 || filesMode == 3 || filesMode == 4) View.VISIBLE else View.GONE
+        btnFilesMove.visibility = if (filesMode == 1 || filesMode == 5) View.VISIBLE else View.GONE
+        btnFilesAct2.visibility = if (filesMode == 5 || filesMode == 4) View.VISIBLE else View.GONE
         if (filesMode == 4) {
-            btnFilesAct.visibility = View.GONE
-            loadBrowse()
+            if (!hasStorageAccess()) {
+                filesInfo.text = "Grant all-files access on the Home tab first."
+                filesAdapter.submitRows(ArrayList<Row>())
+                btnFilesAct.visibility = View.GONE
+                btnFilesAct2.visibility = View.GONE
+                btnFilesDel.isEnabled = false
+                return
+            }
+            btnFilesAct.visibility = View.VISIBLE
+            if (treeRoot == null) {
+                detectVolumes()
+                startTree()
+            } else {
+                renderTree()
+            }
             return
         }
         if (d == null) {
             filesInfo.text = "No scan data yet."
             btnFilesAct.visibility = View.VISIBLE
+            btnFilesAct2.visibility = View.GONE
             btnFilesAct.text = "Scan storage now"
             storageBox.removeAllViews()
             filesAdapter.submitRows(ArrayList<Row>())
             btnFilesDel.isEnabled = false
+            btnFilesMove.isEnabled = false
             return
         }
         if (filesMode == 0) {
@@ -2214,6 +2456,8 @@ class MainActivity : Activity() {
             buildStorageBox(d)
         } else if (filesMode == 1) {
             rebuildLarge(d)
+        } else if (filesMode == 5) {
+            rebuildShrink(d)
         } else {
             rebuildGroups(filesMode == 3)
         }
@@ -2280,6 +2524,8 @@ class MainActivity : Activity() {
         btnFilesAct.text = "Minimum size: " + largeMb.toString() + " MB  (tap to change)"
         btnFilesDel.text = "Delete selected  ·  " + fmt(sel)
         btnFilesDel.isEnabled = sel > 0L && !busyDelete
+        btnFilesMove.text = "Move selected to SD card / other storage  ·  " + fmt(sel)
+        btnFilesMove.isEnabled = sel > 0L && !busyDelete
     }
 
     private fun rebuildGroups(similar: Boolean) {
@@ -2582,82 +2828,13 @@ class MainActivity : Activity() {
 
     // ── Browse (disk-usage explorer) ────────────────────────────────────────
 
-    private fun browseUp() {
-        if (browsePath == rootPath) return
-        val par = File(browsePath).parent
-        browsePath = if (par == null || par.length < rootPath.length) rootPath else par
-        rebuildFiles()
-    }
 
-    private fun browseInto(p: String) {
-        browsePath = p
-        rebuildFiles()
-    }
 
-    private fun browseDelete(fi: FItem) {
-        AlertDialog.Builder(this)
-            .setTitle("Delete " + File(fi.path).name + "?")
-            .setMessage(fmt(fi.size) + (if (fi.isDir) " - folder with everything inside" else "") + "\nThis cannot be undone.")
-            .setPositiveButton("Delete", DialogInterface.OnClickListener { _, _ -> doDelete(listOf(fi)) })
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
 
-    private fun loadBrowse() {
-        if (!hasStorageAccess()) {
-            filesInfo.text = "Grant all-files access on the Home tab first."
-            filesAdapter.submitRows(ArrayList<Row>())
-            return
-        }
-        browseGen = browseGen + 1
-        val gen = browseGen
-        val path = browsePath
-        filesInfo.text = rel(path) + "  ·  calculating sizes..."
-        val dir = File(path)
-        Thread(Runnable {
-            val kids = dir.listFiles()
-            val list = ArrayList<FItem>()
-            var total = 0L
-            if (kids != null) {
-                for (k in kids) {
-                    if (browseGen != gen) return@Runnable
-                    val isD = k.isDirectory
-                    val sz = if (isD) treeSize(k) else k.length()
-                    total += sz
-                    list.add(FItem(k.path, sz, isD, -3, false))
-                }
-            }
-            list.sortByDescending { it.size }
-            val tot = total
-            runOnUiThread {
-                if (browseGen == gen) {
-                    val rows = ArrayList<Row>()
-                    if (path != rootPath) {
-                        val up = Row(T_GROUP)
-                        up.title = "⬆  Up"
-                        up.sub = rel(File(path).parent ?: path)
-                        up.tag = "up"
-                        rows.add(up)
-                    }
-                    for (fi in list) {
-                        val r = Row(T_ITEM)
-                        r.title = File(fi.path).name + (if (fi.isDir) "/" else "")
-                        r.sub = if (fi.isDir) "folder" else "file"
-                        r.right = fmt(fi.size)
-                        r.item = fi
-                        rows.add(r)
-                    }
-                    if (list.isEmpty()) {
-                        val r = Row(T_TEXT)
-                        r.title = "Empty folder."
-                        rows.add(r)
-                    }
-                    filesAdapter.submitRows(rows)
-                    filesInfo.text = rel(path) + "  ·  " + fmt(tot) + "  (tap folder to open, long-press to delete)"
-                }
-            }
-        }).start()
-    }
+
+
+
+
 
     // ── Auto clean ──────────────────────────────────────────────────────────
 
@@ -2684,6 +2861,10 @@ class MainActivity : Activity() {
     }
 
     private fun deleteFilesSelected() {
+        if (filesMode == 4) {
+            deleteTreeSelected()
+            return
+        }
         val d = scan ?: return
         val items = ArrayList<FItem>()
         if (filesMode == 1) {
@@ -2766,6 +2947,800 @@ class MainActivity : Activity() {
             })
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    // ── Non-destructive space savers: system cache trim, move to SD, shrink photos ──
+
+    private fun freeBytes(): Long {
+        return try {
+            StatFs(Environment.getExternalStorageDirectory().path).availableBytes
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    private fun trimSystemCaches() {
+        if (busyDelete) return
+        toast("Asking Android to free app caches...")
+        Thread(Runnable {
+            val before = freeBytes()
+            var msg = ""
+            try {
+                val sm = getSystemService(Context.STORAGE_SERVICE) as StorageManager
+                val uuid = sm.getUuidForPath(filesDir)
+                val allocatable = sm.getAllocatableBytes(uuid)
+                val want = allocatable - 200L * 1048576L
+                if (want <= before) {
+                    msg = "Android reports no extra app cache that it can clear right now."
+                } else {
+                    val tmp = File(cacheDir, "trim.tmp")
+                    val fos = FileOutputStream(tmp)
+                    try {
+                        sm.allocateBytes(fos.fd, want)
+                    } finally {
+                        try {
+                            fos.close()
+                        } catch (e: Exception) {
+                        }
+                        tmp.delete()
+                    }
+                    val after = freeBytes()
+                    val gain = if (after > before) after - before else 0L
+                    msg = "Free space: " + fmt(before) + " -> " + fmt(after) + "  (+" + fmt(gain) + ")"
+                    if (gain > 0L) {
+                        prefs.edit()
+                            .putLong("freed_total", prefs.getLong("freed_total", 0L) + gain)
+                            .putLong("last_clean", System.currentTimeMillis())
+                            .apply()
+                    }
+                }
+            } catch (e: Exception) {
+                msg = "Android did not clear anything (" + (e.message ?: "refused") + ")."
+            }
+            val shown = msg
+            runOnUiThread {
+                refreshHome()
+                AlertDialog.Builder(this)
+                    .setTitle("System cache trim")
+                    .setMessage(shown + "\n\nAndroid itself decides which cache files go. App data, logins and your files are not touched.")
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }).start()
+    }
+
+    private fun onFilesMove() {
+        val d = scan ?: return
+        if (filesMode == 1) {
+            val minB = largeMb.toLong() * 1048576L
+            val items = ArrayList<FItem>()
+            for (fi in d.big) if (fi.checked && fi.size >= minB) items.add(fi)
+            askMove(items)
+        } else if (filesMode == 5) {
+            doShrink()
+        }
+    }
+
+    private fun onFilesAct2() {
+        if (filesMode == 4) {
+            treeTop = (treeTop + 1) % 3
+            renderTree()
+            return
+        }
+        if (filesMode == 5) {
+            val opts = intArrayOf(0, 4096, 3000, 2048, 1600)
+            var idx = 0
+            for (k in opts.indices) if (opts[k] == shrinkDim) idx = k
+            shrinkDim = opts[(idx + 1) % opts.size]
+            rebuildFiles()
+        }
+    }
+
+    private fun askMove(items: ArrayList<FItem>) {
+        if (items.isEmpty()) {
+            toast("Nothing selected")
+            return
+        }
+        moveItems = items
+        AlertDialog.Builder(this)
+            .setTitle("Move " + items.size.toString() + " file(s)?")
+            .setMessage(
+                "Each file is COPIED to the folder you pick (choose a folder on your SD card, USB drive or another storage), " +
+                    "checked by size, and only then removed from here. If a copy fails, the original stays.\n\n" +
+                    "On Android 11+ you cannot pick the root of a drive: create or choose a folder first."
+            )
+            .setPositiveButton("Choose folder", DialogInterface.OnClickListener { _, _ ->
+                try {
+                    startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 4001)
+                } catch (e: Exception) {
+                    toast("No folder picker available")
+                }
+            })
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 4001 && resultCode == RESULT_OK && data != null) {
+            val tree = data.data
+            if (tree != null) doMove(tree)
+        }
+    }
+
+    private fun doMove(tree: Uri) {
+        if (busyDelete) return
+        busyDelete = true
+        val items = ArrayList<FItem>(moveItems)
+        filesInfo.text = "Moving files..."
+        Thread(Runnable {
+            val cr = contentResolver
+            var moved = 0
+            var failed = 0
+            var freed = 0L
+            val gone = ArrayList<String>()
+            try {
+                val rootDoc = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+                val dest = DocumentsContract.createDocument(cr, rootDoc, DocumentsContract.Document.MIME_TYPE_DIR, "Deep Cleaner moved")
+                if (dest == null) throw java.io.IOException("cannot create folder")
+                for (fi in items) {
+                    val src = File(fi.path)
+                    if (!src.isFile || isProtectedPath(fi.path)) {
+                        failed++
+                        continue
+                    }
+                    var out: Uri? = null
+                    var ok = false
+                    try {
+                        val ext = src.name.substringAfterLast('.', "").lowercase()
+                        val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+                        out = DocumentsContract.createDocument(cr, dest, mime, src.name)
+                        if (out != null) {
+                            val os = cr.openOutputStream(out)
+                            if (os != null) {
+                                val ins = FileInputStream(src)
+                                try {
+                                    val buf = ByteArray(131072)
+                                    while (true) {
+                                        val n = ins.read(buf)
+                                        if (n <= 0) break
+                                        os.write(buf, 0, n)
+                                    }
+                                    os.flush()
+                                } finally {
+                                    ins.close()
+                                    os.close()
+                                }
+                                var sz = -1L
+                                val pfd = cr.openFileDescriptor(out, "r")
+                                if (pfd != null) {
+                                    sz = pfd.statSize
+                                    pfd.close()
+                                }
+                                if (sz < 0L) {
+                                    val c = cr.query(out, arrayOf(DocumentsContract.Document.COLUMN_SIZE), null, null, null)
+                                    if (c != null) {
+                                        if (c.moveToFirst() && !c.isNull(0)) sz = c.getLong(0)
+                                        c.close()
+                                    }
+                                }
+                                ok = sz == src.length()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        ok = false
+                    }
+                    if (ok) {
+                        if (src.delete()) {
+                            moved++
+                            freed += fi.size
+                            gone.add(fi.path)
+                        } else {
+                            failed++
+                        }
+                    } else {
+                        failed++
+                        if (out != null) {
+                            try {
+                                DocumentsContract.deleteDocument(cr, out)
+                            } catch (e: Exception) {
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                failed = items.size - moved
+            }
+            scanMedia(gone)
+            val m = moved
+            val f2 = failed
+            val fr = freed
+            runOnUiThread {
+                busyDelete = false
+                if (fr > 0L) {
+                    prefs.edit().putLong("freed_total", prefs.getLong("freed_total", 0L) + fr).apply()
+                }
+                pruneModel(HashSet<String>(gone))
+                rebuildFiles()
+                refreshHome()
+                AlertDialog.Builder(this)
+                    .setTitle("Move finished")
+                    .setMessage(
+                        "Moved " + m.toString() + " file(s) to the folder \"Deep Cleaner moved\".\n" +
+                            "Space freed here: " + fmt(fr) + (if (f2 > 0) "\n" + f2.toString() + " file(s) were left where they are (copy failed or protected)." else "")
+                    )
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }).start()
+    }
+
+    private val exifTags = arrayOf(
+        ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL,
+        ExifInterface.TAG_ORIENTATION, ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF,
+        ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF, ExifInterface.TAG_GPS_ALTITUDE,
+        ExifInterface.TAG_GPS_ALTITUDE_REF, ExifInterface.TAG_GPS_DATESTAMP, ExifInterface.TAG_GPS_TIMESTAMP,
+        ExifInterface.TAG_FLASH, ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_WHITE_BALANCE,
+        ExifInterface.TAG_EXPOSURE_TIME, ExifInterface.TAG_F_NUMBER
+    )
+
+    // Re-compresses one JPEG in place (same name, date, EXIF). Returns the new size, or -1 if left untouched.
+    private fun shrinkOne(path: String, q: Int, dim: Int): Long {
+        val src = File(path)
+        if (!src.isFile) return -1L
+        val tmp = File(src.parentFile, "." + src.name + ".dctmp")
+        try {
+            val o = BitmapFactory.Options()
+            o.inJustDecodeBounds = true
+            BitmapFactory.decodeFile(path, o)
+            val w = o.outWidth
+            val h = o.outHeight
+            if (w <= 0 || h <= 0) return -1L
+            val longSide = if (w > h) w else h
+            var sample = 1
+            if (dim > 0 && longSide > dim) {
+                while (longSide / (sample * 2) >= dim) sample *= 2
+            }
+            val o2 = BitmapFactory.Options()
+            o2.inSampleSize = sample
+            var bmp = BitmapFactory.decodeFile(path, o2) ?: return -1L
+            if (dim > 0) {
+                val ls = if (bmp.width > bmp.height) bmp.width else bmp.height
+                if (ls > dim) {
+                    val sc = dim.toFloat() / ls.toFloat()
+                    val nw = Math.max(1, Math.round(bmp.width * sc))
+                    val nh = Math.max(1, Math.round(bmp.height * sc))
+                    val nb = Bitmap.createScaledBitmap(bmp, nw, nh, true)
+                    if (nb !== bmp) {
+                        bmp.recycle()
+                        bmp = nb
+                    }
+                }
+            }
+            val fos = FileOutputStream(tmp)
+            val okc = try {
+                bmp.compress(Bitmap.CompressFormat.JPEG, q, fos)
+            } finally {
+                fos.close()
+            }
+            bmp.recycle()
+            if (!okc) {
+                tmp.delete()
+                return -1L
+            }
+            val oldLen = src.length()
+            if (tmp.length() <= 0L || tmp.length() > (oldLen * 85L) / 100L) {
+                tmp.delete()
+                return -1L
+            }
+            var metaOk = true
+            try {
+                val a = ExifInterface(path)
+                val b = ExifInterface(tmp.path)
+                for (tag in exifTags) {
+                    val v = a.getAttribute(tag)
+                    if (v != null) b.setAttribute(tag, v)
+                }
+                b.saveAttributes()
+            } catch (e: Exception) {
+                metaOk = false
+            }
+            if (!metaOk) {
+                var ori = 1
+                try {
+                    ori = ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)
+                } catch (e: Exception) {
+                }
+                if (ori != 1 && ori != 0) {
+                    tmp.delete()
+                    return -1L
+                }
+            }
+            if (tmp.length() >= oldLen) {
+                tmp.delete()
+                return -1L
+            }
+            tmp.setLastModified(src.lastModified())
+            if (!tmp.renameTo(src)) {
+                tmp.delete()
+                return -1L
+            }
+            return src.length()
+        } catch (e: Throwable) {
+            try {
+                tmp.delete()
+            } catch (e2: Exception) {
+            }
+            return -1L
+        }
+    }
+
+    private fun doShrink() {
+        val d = scan ?: return
+        if (busyDelete) return
+        val items = ArrayList<FItem>()
+        for (fi in d.jpegs) if (fi.checked) items.add(fi)
+        if (items.isEmpty()) {
+            toast("Nothing selected")
+            return
+        }
+        val q = shrinkQ
+        val dim = shrinkDim
+        AlertDialog.Builder(this)
+            .setTitle("Shrink " + items.size.toString() + " photos?")
+            .setMessage(
+                "Quality " + q.toString() + "%" + (if (dim > 0) ", longest side " + dim.toString() + " px" else ", original size") + ".\n\n" +
+                    "Each photo stays in the same place with the same name, date and location data; only the picture data is " +
+                    "re-compressed. This is lossy and cannot be undone. Photos that would not get at least 15% smaller are left untouched."
+            )
+            .setPositiveButton("Shrink", DialogInterface.OnClickListener { _, _ ->
+                busyDelete = true
+                btnFilesMove.isEnabled = false
+                val results = HashMap<String, Long>()
+                Thread(Runnable {
+                    var saved = 0L
+                    var done = 0
+                    var skipped = 0
+                    val changed = ArrayList<String>()
+                    for (fi in items) {
+                        val ns = shrinkOne(fi.path, q, dim)
+                        if (ns > 0L && ns < fi.size) {
+                            saved += fi.size - ns
+                            results[fi.path] = ns
+                            changed.add(fi.path)
+                            done++
+                        } else {
+                            skipped++
+                        }
+                        val k = done + skipped
+                        runOnUiThread { filesInfo.text = "Shrinking photos... " + k.toString() + " / " + items.size.toString() }
+                    }
+                    scanMedia(changed)
+                    val sv = saved
+                    val dn = done
+                    val sk = skipped
+                    runOnUiThread {
+                        busyDelete = false
+                        for (idx in d.jpegs.indices) {
+                            val fi = d.jpegs[idx]
+                            val ns = results[fi.path]
+                            if (ns != null) d.jpegs[idx] = FItem(fi.path, ns, false, -4, false)
+                        }
+                        if (sv > 0L) {
+                            prefs.edit()
+                                .putLong("freed_total", prefs.getLong("freed_total", 0L) + sv)
+                                .putLong("last_clean", System.currentTimeMillis())
+                                .apply()
+                        }
+                        rebuildFiles()
+                        refreshHome()
+                        AlertDialog.Builder(this)
+                            .setTitle("Shrink finished")
+                            .setMessage("Shrunk " + dn.toString() + " photo(s), saved " + fmt(sv) + ".\n" + sk.toString() + " left untouched (already small, or not worth it).")
+                            .setPositiveButton("OK", null)
+                            .show()
+                    }
+                }).start()
+            })
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun rebuildShrink(d: ScanData) {
+        val rows = ArrayList<Row>()
+        var n = 0
+        var tot = 0L
+        var sel = 0L
+        for (fi in d.jpegs) {
+            n++
+            tot += fi.size
+            if (fi.checked) sel += fi.size
+            if (rows.size < 500) rows.add(itemRow(fi))
+        }
+        if (rows.isEmpty()) {
+            val r = Row(T_TEXT)
+            r.title = "No JPEG photos of 0.5 MB or more found."
+            rows.add(r)
+        }
+        filesAdapter.submitRows(rows)
+        filesInfo.text = n.toString() + " JPEG photos, " + fmt(tot) + " in total. Shrinking keeps every photo, name, date and location; " +
+            "it only re-compresses the picture (lossy)."
+        btnFilesAct.visibility = View.VISIBLE
+        btnFilesAct.text = "Quality: " + shrinkQ.toString() + "%  (tap)"
+        btnFilesAct2.text = "Max size: " + (if (shrinkDim == 0) "original" else shrinkDim.toString() + " px") + "  (tap)"
+        btnFilesMove.text = "Shrink selected photos  ·  " + fmt(sel)
+        btnFilesMove.isEnabled = sel > 0L && !busyDelete
+    }
+
+    // ── Storage tree explorer (internal storage / SD card, hidden folders included) ──
+
+    private val dateFmt = java.text.SimpleDateFormat("d MMM yyyy", Locale.getDefault())
+    private var treeRoot: TNode? = null
+    @Volatile private var treeGen = 0
+    private var treeSort = 0
+    private var treeTop = 0
+    private var volRoots = ArrayList<String>()
+    private var volIdx = 0
+    private var curRoot: String = Environment.getExternalStorageDirectory().path
+
+    private fun detectVolumes() {
+        val out = ArrayList<String>()
+        try {
+            val dirs = getExternalFilesDirs(null)
+            for (d in dirs) {
+                if (d == null) continue
+                val p = d.path
+                val i = p.indexOf("/Android/data")
+                if (i > 0) {
+                    val r = p.substring(0, i)
+                    if (!out.contains(r)) out.add(r)
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (out.isEmpty()) out.add(rootPath)
+        volRoots = out
+        Vols.roots = ArrayList<String>(out)
+    }
+
+    private fun volLabel(i: Int): String {
+        if (i == 0 || i >= volRoots.size) return "Internal storage"
+        return "SD card / USB " + File(volRoots[i]).name
+    }
+
+    private fun startTree() {
+        treeGen = treeGen + 1
+        if (volIdx >= volRoots.size) volIdx = 0
+        curRoot = volRoots[volIdx]
+        val root = TNode(curRoot, volLabel(volIdx), true, -1L, -1, false, 0L)
+        root.expanded = true
+        treeRoot = root
+        renderTree()
+        loadChildren(root)
+    }
+
+    private fun isRestrictedDir(path: String): Boolean {
+        return path.endsWith("/Android/data") || path.endsWith("/Android/obb")
+    }
+
+    private fun sumKnown(list: List<TNode>): Long {
+        var t = 0L
+        for (n in list) if (n.size > 0L) t += n.size
+        return t
+    }
+
+    private fun sortNodes(list: ArrayList<TNode>) {
+        if (treeSort == 0) {
+            list.sortWith(Comparator { a, b -> b.size.compareTo(a.size) })
+        } else if (treeSort == 1) {
+            list.sortWith(Comparator { a, b -> a.name.compareTo(b.name, true) })
+        } else {
+            list.sortWith(Comparator { a, b -> b.mtime.compareTo(a.mtime) })
+        }
+        for (n in list) {
+            if (n.children.isNotEmpty()) sortNodes(n.children)
+        }
+    }
+
+    private fun loadChildren(n: TNode) {
+        if (n.loading) return
+        n.loading = true
+        val gen = treeGen
+        Thread(Runnable {
+            val kids = File(n.path).listFiles()
+            val list = ArrayList<TNode>()
+            if (kids != null) {
+                for (k in kids) {
+                    val isD = k.isDirectory
+                    val nm = k.name
+                    val sz = if (isD) -1L else k.length()
+                    list.add(TNode(k.path, nm, isD, sz, n.level + 1, nm.startsWith(".") || n.hidden, k.lastModified()))
+                }
+            }
+            val restricted = kids == null
+            val work = ArrayList<TNode>(list)
+            runOnUiThread {
+                if (treeGen == gen) {
+                    n.children = list
+                    n.itemCount = list.size
+                    n.restricted = restricted
+                    n.loaded = true
+                    sortNodes(n.children)
+                    renderTree()
+                }
+            }
+            var lastRender = System.currentTimeMillis()
+            for (c in work) {
+                if (treeGen != gen) return@Runnable
+                if (!c.isDir) continue
+                if (isRestrictedDir(c.path)) {
+                    c.size = -2L
+                } else if (isLinkFile(File(c.path))) {
+                    c.size = 0L
+                } else {
+                    c.size = treeSize(File(c.path))
+                }
+                val now = System.currentTimeMillis()
+                if (now - lastRender > 600L) {
+                    lastRender = now
+                    runOnUiThread {
+                        if (treeGen == gen) renderTree()
+                    }
+                }
+            }
+            runOnUiThread {
+                if (treeGen == gen) {
+                    n.loading = false
+                    if (n.size < 0L && !n.restricted) n.size = sumKnown(n.children)
+                    sortNodes(n.children)
+                    renderTree()
+                }
+            }
+        }).start()
+    }
+
+    private fun sizeText(n: TNode): String {
+        if (n.size >= 0L) return fmt(n.size)
+        if (n.size == -2L) return "n/a"
+        return "..."
+    }
+
+    private fun flattenTree(list: List<TNode>, parentSize: Long, out: ArrayList<Row>, top: Boolean) {
+        var shown = 0
+        for (n in list) {
+            if (top) {
+                if (treeTop == 1 && !n.hidden) continue
+                if (treeTop == 2 && n.hidden) continue
+            }
+            if (shown >= 1500) {
+                val mr = Row(T_TEXT)
+                mr.title = "... more items not shown (open sub-folders to narrow down)"
+                mr.indentDp = 6 + 14 * n.level
+                out.add(mr)
+                break
+            }
+            shown++
+            val r = Row(if (n.isDir) T_HEAD else T_ITEM)
+            r.node = n
+            r.title = n.name + (if (n.isDir) "/" else "")
+            r.right = sizeText(n)
+            r.rightColor = if (n.size > 1073741824L) Col.BAD else if (n.size > 209715200L) Col.WARN else Col.TXT
+            r.showCb = true
+            r.checked = n.checked
+            r.expanded = n.expanded
+            r.indentDp = 6 + 14 * n.level + (if (n.isDir) 0 else 22)
+            var sub = ""
+            if (n.isDir) {
+                sub = if (n.restricted) "restricted by Android" else if (n.loaded) n.itemCount.toString() + " items" else "tap to open"
+            } else {
+                sub = dateFmt.format(java.util.Date(n.mtime))
+            }
+            if (n.hidden) sub = "hidden  ·  " + sub
+            if (parentSize > 0L && n.size >= 0L) sub += "  ·  " + (n.size * 100L / parentSize).toString() + "%"
+            r.sub = sub
+            out.add(r)
+            if (n.isDir && n.expanded) {
+                if (!n.loaded) {
+                    val tr = Row(T_TEXT)
+                    tr.title = "reading..."
+                    tr.indentDp = 6 + 14 * (n.level + 1)
+                    out.add(tr)
+                } else if (n.restricted) {
+                    val tr = Row(T_TEXT)
+                    tr.title = "Android blocks this folder for all apps. Use the Apps tab for per-app cache and data sizes."
+                    tr.tag = "apps"
+                    tr.indentDp = 6 + 14 * (n.level + 1)
+                    out.add(tr)
+                } else if (n.children.isEmpty()) {
+                    val tr = Row(T_TEXT)
+                    tr.title = "empty folder"
+                    tr.indentDp = 6 + 14 * (n.level + 1)
+                    out.add(tr)
+                } else {
+                    flattenTree(n.children, if (n.size > 0L) n.size else sumKnown(n.children), out, false)
+                }
+            }
+        }
+    }
+
+    private fun selTreeSize(list: List<TNode>): Long {
+        var t = 0L
+        for (n in list) {
+            if (n.checked) {
+                if (n.size > 0L) t += n.size
+            } else if (n.children.isNotEmpty()) {
+                t += selTreeSize(n.children)
+            }
+        }
+        return t
+    }
+
+    private fun renderTree() {
+        if (filesMode != 4) return
+        val root = treeRoot ?: return
+        val rows = ArrayList<Row>()
+        if (volRoots.size > 1) {
+            val vr = Row(T_GROUP)
+            vr.title = "💾  Drive: " + volLabel(volIdx) + "  (tap to switch)"
+            vr.tag = "vol"
+            rows.add(vr)
+        }
+        val rr = Row(T_GROUP)
+        rr.title = "↻  Rescan sizes"
+        rr.tag = "refresh"
+        rows.add(rr)
+        if (!root.loaded) {
+            val tr = Row(T_TEXT)
+            tr.title = "Reading folders..."
+            rows.add(tr)
+        } else {
+            val ps = if (root.size > 0L) root.size else sumKnown(root.children)
+            flattenTree(root.children, ps, rows, true)
+        }
+        filesAdapter.submitRows(rows)
+
+        var total = 0L
+        var free = 0L
+        try {
+            val st = StatFs(curRoot)
+            total = st.totalBytes
+            free = st.availableBytes
+        } catch (e: Exception) {
+        }
+        val used = total - free
+        var listed = 0L
+        var hiddenSum = 0L
+        for (c in root.children) {
+            if (c.size > 0L) {
+                listed += c.size
+                if (c.hidden) hiddenSum += c.size
+            }
+        }
+        val other = if (used > listed) used - listed else 0L
+        val sel = selTreeSize(root.children)
+        filesInfo.text = volLabel(volIdx) + ": used " + fmt(used) + " of " + fmt(total) + "  ·  free " + fmt(free) +
+            "\nListed folders " + fmt(listed) + "  ·  hidden " + fmt(hiddenSum) + "  ·  apps/system/restricted " + fmt(other) +
+            "\nTap a folder to open it, tick items to delete. Long-press for details."
+        btnFilesAct.text = "Sort: " + (if (treeSort == 0) "size" else if (treeSort == 1) "name" else "date")
+        btnFilesAct2.text = "Top level: " + (if (treeTop == 0) "all" else if (treeTop == 1) "hidden only" else "visible only")
+        btnFilesDel.text = "Delete selected  ·  " + fmt(sel)
+        btnFilesDel.isEnabled = sel > 0L && !busyDelete
+    }
+
+    private fun treeRowClick(r: Row) {
+        if (r.tag == "vol") {
+            volIdx = (volIdx + 1) % volRoots.size
+            startTree()
+            return
+        }
+        if (r.tag == "refresh") {
+            startTree()
+            return
+        }
+        if (r.tag == "apps") {
+            showTab(2)
+            return
+        }
+        val n = r.node ?: return
+        if (n.isDir) {
+            n.expanded = !n.expanded
+            if (n.expanded && !n.loaded && !n.loading) {
+                loadChildren(n)
+            }
+            renderTree()
+        } else {
+            showNodeDetails(n)
+        }
+    }
+
+    private fun treeRowCheck(r: Row, checked: Boolean) {
+        val n = r.node ?: return
+        n.checked = checked
+        renderTree()
+    }
+
+    private fun treeRowLong(r: Row) {
+        val n = r.node ?: return
+        AlertDialog.Builder(this)
+            .setTitle(n.name)
+            .setItems(arrayOf("Details", "Delete..."), DialogInterface.OnClickListener { _, which ->
+                if (which == 0) showNodeDetails(n) else deleteNode(n)
+            })
+            .show()
+    }
+
+    private fun showNodeDetails(n: TNode) {
+        val sb = StringBuilder()
+        sb.append(n.path).append("\n\n")
+        sb.append("Size: ").append(sizeText(n)).append("\n")
+        sb.append("Modified: ").append(dateFmt.format(java.util.Date(n.mtime))).append("\n")
+        if (n.isDir && n.loaded) sb.append("Items inside: ").append(n.itemCount.toString()).append("\n")
+        if (n.hidden) sb.append("Hidden item\n")
+        AlertDialog.Builder(this)
+            .setTitle(n.name)
+            .setMessage(sb.toString())
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun deleteNode(n: TNode) {
+        if (isProtectedPath(n.path)) {
+            toast("Protected top-level folder: open it and delete items inside instead")
+            return
+        }
+        val l = ArrayList<FItem>()
+        l.add(FItem(n.path, if (n.size > 0L) n.size else 0L, n.isDir, -3, true))
+        confirmClean(l)
+    }
+
+    private fun collectChecked(list: List<TNode>, out: ArrayList<FItem>): Int {
+        var prot = 0
+        for (n in list) {
+            if (n.checked) {
+                if (isProtectedPath(n.path)) {
+                    prot++
+                } else {
+                    out.add(FItem(n.path, if (n.size > 0L) n.size else 0L, n.isDir, -3, true))
+                }
+            } else if (n.children.isNotEmpty()) {
+                prot += collectChecked(n.children, out)
+            }
+        }
+        return prot
+    }
+
+    private fun deleteTreeSelected() {
+        val root = treeRoot ?: return
+        val items = ArrayList<FItem>()
+        val prot = collectChecked(root.children, items)
+        if (prot > 0) toast(prot.toString() + " protected top-level folder(s) skipped")
+        confirmClean(items)
+    }
+
+    private fun pruneNodes(list: ArrayList<TNode>, gone: Set<String>): Long {
+        var removed = 0L
+        val it = list.iterator()
+        while (it.hasNext()) {
+            val n = it.next()
+            if (gone.contains(n.path)) {
+                if (n.size > 0L) removed += n.size
+                it.remove()
+            } else if (n.children.isNotEmpty()) {
+                val r = pruneNodes(n.children, gone)
+                if (n.size >= 0L) n.size = if (n.size > r) n.size - r else 0L
+                n.itemCount = n.children.size
+                removed += r
+            }
+        }
+        return removed
+    }
+
+    private fun pruneTreeRoot(gone: Set<String>) {
+        val root = treeRoot ?: return
+        val r = pruneNodes(root.children, gone)
+        if (root.size >= 0L) root.size = if (root.size > r) root.size - r else 0L
+        root.itemCount = root.children.size
     }
 
     // ── BOOST TAB ───────────────────────────────────────────────────────────
@@ -2936,6 +3911,7 @@ class MainActivity : Activity() {
             "Large-file minimum: " + largeMb.toString() + " MB",
             "Excluded folders (" + excludedList().size.toString() + ")",
             "Auto-clean weekly (safe categories): " + (if (autoEnabled()) "ON" else "OFF"),
+            "Clean new junk when storage grows (on open): " + (if (growthOn()) "ON" else "OFF"),
             "About & limits",
             "Reset 'freed so far' counter"
         )
@@ -2951,6 +3927,10 @@ class MainActivity : Activity() {
                     refreshHome()
                     toast(if (autoEnabled()) "Auto-clean ON: runs about weekly while charging" else "Auto-clean OFF")
                 } else if (which == 3) {
+                    prefs.edit().putBoolean("growth_on", !growthOn()).apply()
+                    saveBaseline()
+                    toast(if (growthOn()) "Growth clean ON: checks every time you open the app" else "Growth clean OFF")
+                } else if (which == 4) {
                     showAbout()
                 } else {
                     prefs.edit().remove("freed_total").remove("last_clean").apply()
@@ -3012,15 +3992,18 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("About & limits")
             .setMessage(
-                "Cleans: temp / log / thumbnail files, gallery trash, hidden cache folders, ad-SDK leftovers, empty folders, " +
-                    "viewed WhatsApp status cache, installers, incomplete downloads, old downloads, screenshots, messenger media, " +
-                    "old chat backups, leftovers of uninstalled apps, large files, exact duplicates and similar photos. " +
-                    "Browse shows what uses space, folder by folder.\n\n" +
-                    "Items marked (review) are NOT selected by default - check them first. Auto-clean only touches the safe categories.\n\n" +
-                    "Limits of Android: other apps' private caches and the folders Android/data and Android/obb cannot be read or " +
-                    "deleted by any normal app without root. Use the Apps tab: Auto-clean ALL app caches (needs the Accessibility helper) or open each app's Storage page.\n\n" +
+                "Safe junk (pre-selected): temp / log files, thumbnails, hidden cache folders, ad-SDK leftovers, viewed status cache. " +
+                    "Everything else (trash, empty folders, installers, downloads, screenshots, messenger media, duplicates...) is marked (review) and NOT selected by default. " +
+                    "Auto-clean only touches the safe list, and the top-level folders (DCIM, Pictures, Download, Documents...) can never be deleted.\n\n" +
+                    "Explore tab (or tap the storage ring on Home): full size tree of internal storage and SD card, hidden folders included. Tap a folder to open it, tick items and delete them.\n\n" +
+                    "More space without deleting your files:\n" +
+                    "- Shrink: re-compresses big JPEG photos in place (same name, date, location).\n" +
+                    "- Move: copies big files to your SD card / USB, checks them, then removes them from the phone.\n" +
+                    "- Trim app caches: asks Android itself to clear other apps' caches.\n" +
+                    "- Auto-clean ALL app caches (Apps tab) with the Accessibility helper.\n\n" +
+                    "Limits of Android: other apps' private data and the folders Android/data and Android/obb cannot be touched without root. " +
                     "RAM boost only stops background processes; Android may restart them.\n\n" +
-                    "Deleted files are removed permanently (there is no recycle bin)."
+                    "Deleted files are removed permanently (there is no recycle bin), so check the (review) lists before cleaning."
             )
             .setPositiveButton("OK", null)
             .show()
