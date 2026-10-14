@@ -686,7 +686,7 @@ class RowAdapter(private val act: Activity, private val lis: RowL) : BaseAdapter
         return (v * act.resources.displayMetrics.density + 0.5f).toInt()
     }
 
-    fun setRows(r: List<Row>) {
+    fun submitRows(r: List<Row>) {
         rows = r
         notifyDataSetChanged()
     }
@@ -1365,7 +1365,7 @@ class MainActivity : Activity() {
                 rows.add(r)
             }
         }
-        junkAdapter.setRows(rows)
+        junkAdapter.submitRows(rows)
         if (d != null) {
             junkInfo.text = "Found " + fmt(found) + " (safe " + fmt(safe) + ")  ·  Selected " + fmt(sel)
         }
@@ -1774,7 +1774,7 @@ class MainActivity : Activity() {
             r.rightColor = if (a.cache > 50L * 1024L * 1024L) Col.BAD else if (a.cache > 10L * 1024L * 1024L) Col.WARN else Col.TXT
             rows.add(r)
         }
-        appsAdapter.setRows(rows)
+        appsAdapter.submitRows(rows)
         appsInfo.text = list.size.toString() + " apps" + (if (usageOk) "  ·  total cache " + fmt(cacheSum) else "") +
             "\nAndroid only lets you clear another app's cache from its own info page."
         val names = arrayOf("Cache", "Size", "Unused", if (appsShowSystem) "All apps" else "User apps")
@@ -1922,7 +1922,7 @@ class MainActivity : Activity() {
             btnFilesAct.visibility = View.VISIBLE
             btnFilesAct.text = "Scan storage now"
             storageBox.removeAllViews()
-            filesAdapter.setRows(ArrayList<Row>())
+            filesAdapter.submitRows(ArrayList<Row>())
             btnFilesDel.isEnabled = false
             return
         }
@@ -1991,7 +1991,7 @@ class MainActivity : Activity() {
             r.title = "No files of " + largeMb.toString() + " MB or more."
             rows.add(r)
         }
-        filesAdapter.setRows(rows)
+        filesAdapter.submitRows(rows)
         filesInfo.text = n.toString() + " files >= " + largeMb.toString() + " MB  ·  " + fmt(tot) + "  (tap to select, long-press for path)"
         btnFilesAct.visibility = View.VISIBLE
         btnFilesAct.text = "Minimum size: " + largeMb.toString() + " MB  (tap to change)"
@@ -2049,7 +2049,7 @@ class MainActivity : Activity() {
             }
             filesInfo.text = g.size.toString() + " groups  ·  can free " + fmt(wasted) + "  (★ = suggested keeper)"
         }
-        filesAdapter.setRows(rows)
+        filesAdapter.submitRows(rows)
         btnFilesDel.text = "Delete selected  ·  " + fmt(sel)
         btnFilesDel.isEnabled = sel > 0L && !busyDelete && !busy
     }
@@ -2323,7 +2323,7 @@ class MainActivity : Activity() {
     private fun loadBrowse() {
         if (!hasStorageAccess()) {
             filesInfo.text = "Grant all-files access on the Home tab first."
-            filesAdapter.setRows(ArrayList<Row>())
+            filesAdapter.submitRows(ArrayList<Row>())
             return
         }
         browseGen = browseGen + 1
@@ -2369,7 +2369,7 @@ class MainActivity : Activity() {
                         r.title = "Empty folder."
                         rows.add(r)
                     }
-                    filesAdapter.setRows(rows)
+                    filesAdapter.submitRows(rows)
                     filesInfo.text = rel(path) + "  ·  " + fmt(tot) + "  (tap folder to open, long-press to delete)"
                 }
             }
@@ -2449,7 +2449,7 @@ class MainActivity : Activity() {
         boostAdapter = RowAdapter(this, object : RowL() {
             override fun onRow(r: Row) {
                 r.checked = !r.checked
-                boostAdapter.setRows(boostRows)
+                boostAdapter.submitRows(boostRows)
             }
 
             override fun onCheck(r: Row, checked: Boolean) {
@@ -2466,7 +2466,7 @@ class MainActivity : Activity() {
 
     private fun boostSelect(on: Boolean) {
         for (r in boostRows) r.checked = on
-        boostAdapter.setRows(boostRows)
+        boostAdapter.submitRows(boostRows)
     }
 
     private fun loadBoost() {
@@ -2539,7 +2539,7 @@ class MainActivity : Activity() {
                     r.checked = true
                     boostRows.add(r)
                 }
-                boostAdapter.setRows(boostRows)
+                boostAdapter.submitRows(boostRows)
                 boostBusy = false
                 boostLoaded = true
                 refreshRam()
