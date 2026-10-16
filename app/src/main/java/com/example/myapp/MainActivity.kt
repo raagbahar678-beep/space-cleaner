@@ -1199,6 +1199,8 @@ class MainActivity : Activity() {
     private lateinit var homeRamTv: TextView
     private lateinit var homePermCard: LinearLayout
     private lateinit var homeStatsTv: TextView
+    private lateinit var homeTargetTv: TextView
+    private lateinit var btnTarget: Button
 
     // junk
     private lateinit var junkList: ListView
@@ -1536,6 +1538,197 @@ class MainActivity : Activity() {
         }).start()
     }
 
+    // ── Target size: fix a used-storage size, one tap brings it back ─────────
+    // Order of work: (1) delete newest SAFE junk, (2) ask Android to drop app caches,
+    // Nothing else is ever deleted: your files, folders, photos, downloads, chats and apps are never touched.
+
+    private fun targetBytes(): Long {
+        return prefs.getLong("target_used", -1L)
+    }
+
+    private fun refreshTarget() {
+        val t = targetBytes()
+        val used = usedBytes()
+        if (t <= 0L || used < 0L) {
+            homeTargetTv.text = "🎯 Target size: not set\nSet the used-storage size you want to stay at, then bring it back with one tap."
+            btnTarget.text = "Set target size"
+            return
+        }
+        val over = used - t
+        homeTargetTv.text = "🎯 Target: " + fmt(t) + "   ·   Now: " + fmt(used) + "\n" +
+            (if (over > 0L) "Over target by " + fmt(over) else "At or below target ✔")
+        btnTarget.text = if (over > 0L) "Bring back to " + fmt(t) else "Target reached ✔ (tap to re-check)"
+    }
+
+    private fun onTargetButton() {
+        if (targetBytes() <= 0L) showTargetDialog() else runTargetClean()
+    }
+
+    private fun showTargetDialog() {
+        val used = usedBytes()
+        val cur = targetBytes()
+        val et = EditText(this)
+        et.hint = "e.g. 47.35"
+        et.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        if (cur > 0L) et.setText(String.format(Locale.US, "%.2f", cur / 1073741824.0))
+        AlertDialog.Builder(this)
+            .setTitle("Target used storage")
+            .setMessage(
+                "Used internal storage right now: " + fmt(used) + " (measured the same way as the ring on the home screen, " +
+                    "so it can differ slightly from Android Settings).\n\nType the size in GB to stay at:"
+            )
+            .setView(et)
+            .setPositiveButton("Save", DialogInterface.OnClickListener { _, _ ->
+                val txt = et.text.toString().trim().replace(',', '.')
+                val gb = txt.toDoubleOrNull()
+                if (gb == null || gb <= 0.0) {
+                    toast("Enter a number like 47.35")
+                } else {
+                    prefs.edit().putLong("target_used", (gb * 1073741824.0).toLong()).apply()
+                    refreshHome()
+                    toast("Target saved: " + String.format(Locale.US, "%.2f", gb) + " GB")
+                }
+            })
+            .setNeutralButton("Use current", DialogInterface.OnClickListener { _, _ ->
+                if (used > 0L) {
+                    prefs.edit().putLong("target_used", used).apply()
+                    refreshHome()
+                    toast("Target set to " + fmt(used))
+                }
+            })
+            .setNegativeButton(if (cur > 0L) "Remove target" else "Cancel", DialogInterface.OnClickListener { _, _ ->
+                if (cur > 0L) {
+                    prefs.edit().remove("target_used").apply()
+                    refreshHome()
+                    toast("Target removed")
+                }
+            })
+            .show()
+    }
+
+    private fun runTargetClean() {
+        if (growthBusy || busyDelete || scanning || CacheJob.running) {
+            toast("Busy - try again in a moment")
+            return
+        }
+        if (!hasStorageAccess()) {
+            requestStorageAccess()
+            return
+        }
+        val t = targetBytes()
+        val used0 = usedBytes()
+        if (t <= 0L || used0 < 0L) {
+            showTargetDialog()
+            return
+        }
+        if (used0 <= t) {
+            toast("Already at or below target")
+            refreshHome()
+            return
+        }
+        growthBusy = true
+        toast("Cleaning back to " + fmt(t) + "...")
+        val inst = HashSet<String>()
+        try {
+            for (ai in packageManager.getInstalledApplications(0)) inst.add(ai.packageName.lowercase())
+        } catch (e: Exception) {
+        }
+        val ex = excludedList()
+        Thread(Runnable {
+            val margin = 10L * 1048576L
+            var freed = 0L
+            val deleted = ArrayList<String>()
+            try {
+                val data = ScanData()
+                val sc = Scanner(this, Environment.getExternalStorageDirectory(), inst, ex, data)
+                sc.run()
+                val safe = ArrayList<FItem>()
+                for (c in data.cats) {
+                    if (!c.review) safe.addAll(c.items)
+                }
+                val newestFirst = Comparator<FItem> { a, b -> File(b.path).lastModified().compareTo(File(a.path).lastModified()) }
+                safe.sortWith(newestFirst)
+
+                // 1) safe junk
+                var cur = usedBytes()
+                if (cur > t) {
+                    val need = cur - t + margin
+                    val pick = ArrayList<FItem>()
+                    var s = 0L
+                    for (fi in safe) {
+                        if (s >= need) break
+                        pick.add(fi)
+                        s += fi.size
+                    }
+                    freed += deleteFItems(pick, deleted)
+                }
+                // 2) Android's own app caches
+                cur = usedBytes()
+                if (cur > t) {
+                    try {
+                        val sm = getSystemService(Context.STORAGE_SERVICE) as StorageManager
+                        val uuid = sm.getUuidForPath(filesDir)
+                        val want = sm.getAllocatableBytes(uuid) - 200L * 1048576L
+                        val before = freeBytes()
+                        if (want > before) {
+                            val tmp = File(cacheDir, "trim.tmp")
+                            val fos = FileOutputStream(tmp)
+                            try {
+                                sm.allocateBytes(fos.fd, want)
+                            } finally {
+                                try {
+                                    fos.close()
+                                } catch (e: Exception) {
+                                }
+                                tmp.delete()
+                            }
+                            val after = freeBytes()
+                            if (after > before) freed += after - before
+                        }
+                    } catch (e: Exception) {
+                    }
+                }
+                if (deleted.isNotEmpty()) scanMedia(deleted)
+            } catch (e: Exception) {
+            }
+            val fr = freed
+            runOnUiThread {
+                growthBusy = false
+                val after = usedBytes()
+                if (after >= 0L) prefs.edit().putLong("base_used", after).apply()
+                if (fr > 0L) {
+                    prefs.edit()
+                        .putLong("freed_total", prefs.getLong("freed_total", 0L) + fr)
+                        .putLong("last_clean", System.currentTimeMillis())
+                        .apply()
+                }
+                scan = null
+                refreshHome()
+                rebuildJunk()
+                if (!isFinishing) {
+                    val b = AlertDialog.Builder(this).setTitle("Target size")
+                    if (after in 0L..t) {
+                        b.setMessage("Back at target.\nNow " + fmt(after) + "  (target " + fmt(t) + ").\nFreed about " + fmt(fr) + ".")
+                        b.setPositiveButton("OK", null)
+                    } else {
+                        val rest = after - t
+                        var msg = "Cleaned about " + fmt(fr) + ", but storage is still " + fmt(rest) + " over the target " +
+                            "(now " + fmt(after) + ").\nThe rest is not safe junk: new photos, videos, downloads, chats or app data."
+                        msg += "\n\nNothing of yours was deleted. Use Large files to review it yourself."
+                        b.setPositiveButton("OK", null)
+                        b.setMessage(msg)
+                        b.setNeutralButton("Review large files", DialogInterface.OnClickListener { _, _ ->
+                            showTab(3)
+                            setFilesMode(1)
+                        })
+                        b.setNegativeButton("Close", null)
+                    }
+                    b.show()
+                }
+            }
+        }).start()
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (curTab != 0) showTab(0) else super.onBackPressed()
@@ -1619,9 +1812,24 @@ class MainActivity : Activity() {
         tr.addView(homeRamTv, LinearLayout.LayoutParams(0, WC, 1f))
         col.addView(tr, lpm(MP, WC, 0f, 0, 4, 0, 0))
 
+        // Target size card: fix a used-storage size, then one tap brings it back
+        val tcard = LinearLayout(this)
+        tcard.orientation = LinearLayout.VERTICAL
+        tcard.background = roundBg(Col.CARD2, 12)
+        tcard.setPadding(dp(14), dp(12), dp(14), dp(12))
+        homeTargetTv = mkText("", 13f, Col.TXT, false)
+        tcard.addView(homeTargetTv)
+        btnTarget = mkBtn("Set target size", Col.ACC, Col.DARKTXT) { onTargetButton() }
+        tcard.addView(btnTarget, lpm(MP, WC, 0f, 0, 8, 0, 0))
+        tcard.addView(
+            mkBtn("Change target", Col.CARD, Col.SUB) { showTargetDialog() },
+            lpm(MP, WC, 0f, 0, 6, 0, 0)
+        )
+        col.addView(tcard, lpm(MP, WC, 0f, 0, 14, 0, 0))
+
         col.addView(
             mkBtn("⚡  Analyze & Quick Clean", Col.ACC, Col.DARKTXT) { startScan(true) },
-            lpm(MP, WC, 0f, 0, 18, 0, 0)
+            lpm(MP, WC, 0f, 0, 12, 0, 0)
         )
 
         val r1 = LinearLayout(this)
@@ -1700,6 +1908,7 @@ class MainActivity : Activity() {
             s += "\nAuto-clean: ON (weekly, while charging, safe categories only)"
         }
         homeStatsTv.text = s
+        refreshTarget()
     }
 
     // ── JUNK TAB ────────────────────────────────────────────────────────────
